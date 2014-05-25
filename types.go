@@ -7,6 +7,7 @@ type ContainerConfig struct {
 	Memory          int
 	MemorySwap      int
 	CpuShares       int
+	Cpuset          string
 	AttachStdin     bool
 	AttachStdout    bool
 	AttachStderr    bool
