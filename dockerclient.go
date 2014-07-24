@@ -2,14 +2,19 @@ package dockerclient
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
-	"net"
+	"log"
 	"net/http"
 	"net/url"
 	"sync/atomic"
-	"time"
+)
+
+var (
+	ErrNotFound = errors.New("Not found")
 )
 
 type DockerClient struct {
@@ -18,29 +23,18 @@ type DockerClient struct {
 	monitorEvents int32
 }
 
-func NewDockerClient(daemonUrl string) (*DockerClient, error) {
+type Callback func(*Event, ...interface{})
+
+func NewDockerClient(daemonUrl string, tlsConfig *tls.Config) (*DockerClient, error) {
 	u, err := url.Parse(daemonUrl)
 	if err != nil {
 		return nil, err
 	}
-	httpClient := newHTTPClient(u)
-	return &DockerClient{u, httpClient, 0}, nil
-}
-
-func newHTTPClient(u *url.URL) *http.Client {
-	httpTransport := &http.Transport{}
-	if u.Scheme == "unix" {
-		socketPath := u.Path
-		unixDial := func(proto string, addr string) (net.Conn, error) {
-			return net.Dial("unix", socketPath)
-		}
-		httpTransport.Dial = unixDial
-		// Override the main URL object so the HTTP lib won't complain
+	if u.Scheme == "tcp" {
 		u.Scheme = "http"
-		u.Host = "unix.sock"
 	}
-	u.Path = ""
-	return &http.Client{Transport: httpTransport}
+	httpClient := newHTTPClient(u, tlsConfig)
+	return &DockerClient{u, httpClient, 0}, nil
 }
 
 func (client *DockerClient) doRequest(method string, path string, body []byte) ([]byte, error) {
@@ -49,6 +43,7 @@ func (client *DockerClient) doRequest(method string, path string, body []byte) (
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Add("Content-Type", "application/json")
 	resp, err := client.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -57,6 +52,9 @@ func (client *DockerClient) doRequest(method string, path string, body []byte) (
 	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == 404 {
+		return nil, ErrNotFound
 	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("%s: %s", resp.Status, data)
@@ -96,12 +94,18 @@ func (client *DockerClient) InspectContainer(id string) (*ContainerInfo, error) 
 	return info, nil
 }
 
-func (client *DockerClient) CreateContainer(config *ContainerConfig) (string, error) {
+func (client *DockerClient) CreateContainer(config *ContainerConfig, name string) (string, error) {
 	data, err := json.Marshal(config)
 	if err != nil {
 		return "", err
 	}
 	uri := "/v1.10/containers/create"
+
+	if name != "" {
+		v := url.Values{}
+		v.Set("name", name)
+		uri = fmt.Sprintf("%s?%s", uri, v.Encode())
+	}
 	data, err = client.doRequest("POST", uri, data)
 	if err != nil {
 		return "", err
@@ -114,9 +118,13 @@ func (client *DockerClient) CreateContainer(config *ContainerConfig) (string, er
 	return result.Id, nil
 }
 
-func (client *DockerClient) StartContainer(id string) error {
+func (client *DockerClient) StartContainer(id string, config *HostConfig) error {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
 	uri := fmt.Sprintf("/v1.10/containers/%s/start", id)
-	_, err := client.doRequest("POST", uri, nil)
+	_, err = client.doRequest("POST", uri, data)
 	if err != nil {
 		return err
 	}
@@ -150,44 +158,29 @@ func (client *DockerClient) KillContainer(id string) error {
 	return nil
 }
 
-func (client *DockerClient) StartMonitorEvents(cb func(*Event, ...interface{}), args ...interface{}) {
+func (client *DockerClient) StartMonitorEvents(cb Callback, args ...interface{}) {
 	atomic.StoreInt32(&client.monitorEvents, 1)
-	wait := 100 * time.Millisecond
-	buffer := make([]byte, 4096)
-	var running int32 = 1
-	go func() {
-		for running > 0 {
-			running = atomic.LoadInt32(&client.monitorEvents)
-			if running == 0 {
-				break
-			}
-			uri := client.URL.String() + "/v1.10/events"
-			resp, err := client.HTTPClient.Get(uri)
-			if err != nil {
-				time.Sleep(wait)
-				continue
-			}
-			if resp.StatusCode >= 300 {
-				resp.Body.Close()
-				time.Sleep(wait)
-				continue
-			}
-			for {
-				nBytes, err := resp.Body.Read(buffer)
-				if err != nil {
-					resp.Body.Close()
-					time.Sleep(wait)
-					break
-				}
-				event := &Event{}
-				err = json.Unmarshal(buffer[:nBytes], event)
-				if err == nil {
-					cb(event, args...)
-				}
-			}
-			time.Sleep(wait)
+	go client.getEvents(cb, args...)
+}
+
+func (client *DockerClient) getEvents(cb Callback, args ...interface{}) {
+	uri := client.URL.String() + "/v1.10/events"
+	resp, err := client.HTTPClient.Get(uri)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer resp.Body.Close()
+
+	dec := json.NewDecoder(resp.Body)
+	for atomic.LoadInt32(&client.monitorEvents) > 0 {
+		var event *Event
+		if err := dec.Decode(&event); err != nil {
+			log.Println(err)
+			return
 		}
-	}()
+		cb(event, args...)
+	}
 }
 
 func (client *DockerClient) StopAllMonitorEvents() {
@@ -205,4 +198,33 @@ func (client *DockerClient) Version() (*Version, error) {
 		return nil, err
 	}
 	return version, nil
+}
+
+func (client *DockerClient) PullImage(name, tag string) error {
+	v := url.Values{}
+	v.Set("fromImage", name)
+	if tag != "" {
+		v.Set("tag", tag)
+	}
+	_, err := client.doRequest("POST", "/v1.10/images/create?"+v.Encode(), nil)
+	return err
+}
+
+func (client *DockerClient) RemoveContainer(id string) error {
+	_, err := client.doRequest("DELETE", fmt.Sprintf("/v1.10/containers/%s", id), nil)
+	return err
+}
+
+func (client *DockerClient) ListImages() ([]*Image, error) {
+	data, err := client.doRequest("GET", "/v1.10/images/json", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var images []*Image
+	if err := json.Unmarshal(data, &images); err != nil {
+		return nil, err
+	}
+
+	return images, nil
 }

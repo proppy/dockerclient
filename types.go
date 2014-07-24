@@ -7,20 +7,23 @@ type ContainerConfig struct {
 	Memory          int
 	MemorySwap      int
 	CpuShares       int
+	Cpuset          string
 	AttachStdin     bool
 	AttachStdout    bool
 	AttachStderr    bool
+	PortSpecs       []string
+	ExposedPorts    map[string]struct{}
 	Tty             bool
 	OpenStdin       bool
 	StdinOnce       bool
 	Env             []string
 	Cmd             []string
-	Dns             []string
 	Image           string
-	VolumesFrom     string
+	Volumes         map[string]struct{}
 	WorkingDir      string
 	Entrypoint      []string
 	NetworkDisabled bool
+	OnBuild         []string
 }
 
 type HostConfig struct {
@@ -31,6 +34,10 @@ type HostConfig struct {
 	PortBindings    map[string][]PortBinding
 	Links           []string
 	PublishAllPorts bool
+	Dns             []string
+	DnsSearch       []string
+	VolumesFrom     []string
+	NetworkMode     string
 }
 
 type PortBinding struct {
@@ -39,12 +46,13 @@ type PortBinding struct {
 }
 
 type ContainerInfo struct {
-	Id     string
-	Create string
-	Path   string
-	Args   []string
-	Config *ContainerConfig
-	State  struct {
+	Id      string
+	Created string
+	Path    string
+	Name    string
+	Args    []string
+	Config  *ContainerConfig
+	State   struct {
 		Running   bool
 		Pid       int
 		ExitCode  int
@@ -99,4 +107,13 @@ type Version struct {
 type RespContainersCreate struct {
 	Id       string
 	Warnings []string
+}
+
+type Image struct {
+	Created     int64
+	Id          string
+	ParentId    string
+	RepoTags    []string
+	Size        int64
+	VirtualSize int64
 }
